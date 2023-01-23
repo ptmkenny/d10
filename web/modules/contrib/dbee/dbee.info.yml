@@ -1,0 +1,15 @@
+name: 'DataBase Email Encryption'
+type: module
+description: 'Encrypt user email addresses stored into the database for security reasons. This module doesn''t alter user experience'
+package: Security
+dependencies:
+  - drupal:user
+  - encrypt:encrypt
+  - real_aes:real_aes
+configure: entity.encryption_profile.collection
+core_version_requirement: ^9.3 || ^10
+
+# Information added by Drupal.org packaging script on 2022-12-21
+version: '3.0.0-rc2'
+project: 'dbee'
+datestamp: 1671663044

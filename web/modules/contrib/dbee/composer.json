@@ -1,0 +1,15 @@
+{
+    "name": "drupal/dbee",
+    "description": "Encrypt user email addresses stored into the database for security reasons. This module doesn''t alter user experience",
+    "type": "drupal-module",
+    "license": "GPL-2.0-or-later",
+    "homepage": "https://drupal.org/project/dbee",
+    "support": {
+        "issues": "https://drupal.org/project/issues/dbee",
+        "source": "https://git.drupalcode.org/project/dbee"
+    },
+    "require": {
+        "drupal/encrypt": "^3.1",
+        "drupal/real_aes": "^2.5"
+    }
+}

@@ -1,0 +1,1253 @@
+<?php
+
+/**
+ * @file
+ * Hook and main functions for the dbee module.
+ */
+
+use Drupal\Core\Render\BubbleableMetadata;
+use Drupal\user\Entity\User;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Database\Query\AlterableInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\encrypt\Entity\EncryptionProfile;
+use Drupal\encrypt\Exception\EncryptException;
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Routing\RouteMatchInterface;
+
+define('DBEE_ENCRYPT_NAME', 'dbee');
+define('DBEE_PREV_ENCRYPT_NAME', 'dbee_prev');
+define('DBEE_DEFAULT_KEY_NAME', 'dbee');
+define('DBEE_PREV_KEY_NAME', 'dbee_prev');
+define('DBEE_DEFAULT_ENCRYPTION_METHOD', 'real_aes');
+define('DBEE_DEFAULT_KEY_FILENAME', 'dbee.key');
+define('DBEE_DEFAULT_KEY_BYTES', 32);
+
+/**
+ * Tests whether the email address value needs to be altered.
+ *
+ * The dbee module will only encrypt valid email addresses.
+ * Invalid data is stored without encryption.
+ *
+ * @param string $email
+ *   The user email value (mail, init).
+ *
+ * @return bool
+ *   TRUE if the data is a valid email address and should be encrypted.
+ */
+function dbee_email_to_alter($email) {
+  if (is_string($email) && $email !== '') {
+    $email = trim($email);
+    return \Drupal::service('email.validator')->isValid($email);
+  }
+  return FALSE;
+}
+
+/**
+ * Provides the value for an email address stored in the database.
+ *
+ * Returns the encrypted value for an email address. This is used, for example,
+ * in operations to inspect or update email address values in the user table.
+ * It can provide either the encrypted value of the lowercase email address or
+ * the encrypted value of the case-sensitive email address. This function only
+ * alters data if necessary, thereby preserving information. Always use
+ * it to encrypt data.
+ *
+ * @param string $string
+ *   The unencrypted (readable) email address to encrypt.
+ *
+ * @return string
+ *   The serialized encrypted email address value (lowercase or case-sensitive),
+ *   or the data value if encryption is not needed.
+ */
+function dbee_encrypt($string) {
+  if (dbee_email_to_alter($string)) {
+    // The email address is valid.
+    $encryption_profile = EncryptionProfile::load(DBEE_ENCRYPT_NAME);
+    try {
+      $encrypted = utf8_encode(\Drupal::service('encryption')->encrypt($string, $encryption_profile));
+      // Ensure the encrypted value is correct.
+      // (Check if the email address is no longer valid.)
+      $decrypt = dbee_decrypt($encrypted);
+      if (!dbee_email_to_alter($encrypted) && dbee_email_to_alter($decrypt)) {
+        return $encrypted;
+      }
+    }
+    catch (EncryptException $e) {
+    }
+  }
+  // Do not alter the data if:
+  // * The data is empty.
+  // * The data is not a valid email address.
+  // * The data is already encrypted.
+  // * Encryption has failed.
+  return $string;
+}
+
+/**
+ * Decrypts an email address if needed.
+ *
+ * Returns the unencrypted provided value or the exact provided value if not
+ * encrypted or if encryption fails. This function only alters data if
+ * necessary, thereby preserving information. Always use it to decrypt data.
+ *
+ * @param string $string
+ *   The encrypted (non-readable) email address to decrypt.
+ * @param bool $prev_encrypt
+ *   If TRUE, use a previous dbee encryption profile to decrypt, which is
+ *   used when changing the encryption settings. Defaults to FALSE.
+ *
+ * @return string
+ *   A string corresponding to the decrypted email address value or the provided
+ *   value if decryption is not needed.
+ */
+function dbee_decrypt($string, $prev_encrypt = FALSE) {
+  if (!empty($string) && !dbee_email_to_alter($string)) {
+    // The email address is not valid.
+    $encrypt_profile = (!$prev_encrypt) ? DBEE_ENCRYPT_NAME : DBEE_PREV_ENCRYPT_NAME;
+    $encryption_profile = EncryptionProfile::load($encrypt_profile);
+    try {
+      $uncrypted_mail = utf8_encode(\Drupal::service('encryption')->decrypt(utf8_decode($string), $encryption_profile));
+      // Check whether the decrypted email address is valid before returning it.
+      if ($uncrypted_mail && dbee_email_to_alter($uncrypted_mail)) {
+        // The decrypted value is a valid email address, so return it.
+        return $uncrypted_mail;
+      }
+    }
+    catch (EncryptException $e) {
+    }
+  }
+  // Do not alter the data if:
+  // * The email address is empty.
+  // * The email address has already been decrypted.
+  // * Decryption has failed.
+  return $string;
+}
+
+/**
+ * Provides the encrypted email address values for storing in the database.
+ *
+ * Provide the encrypted values for 2 fields in the {users_field_data} table
+ * (the 'mail' and 'init' fields).
+ *
+ * @param array $mails
+ *   An array of values to encrypt. Keys are 'mail' and 'init'.
+ *
+ * @return array
+ *   An array of encrypted email addresses. Keys are 'mail' and 'init'.
+ */
+function dbee_store(array $mails) {
+  if (!is_array($mails)) {
+    return [];
+  }
+
+  $to_store = $edited_value = [];
+  $mail_edited_value = FALSE;
+  foreach (['mail', 'init'] as $dbee_field) {
+    // $edit value overwrites the $account value.
+    $edited_value = $mails[$dbee_field];
+    // For performance reasons, do not decrypt the value twice.
+    // If mail and init are identical, return the same encryption value.
+    $mail_init_equal = ($mail_edited_value !== FALSE && $edited_value == $mail_edited_value);
+    // Store the encrypted values.
+    $to_store[$dbee_field] = ($mail_edited_value === FALSE || !$mail_init_equal) ? dbee_encrypt($edited_value) : $to_store['mail'];
+    // Save the 'mail' value in order to compare it to the 'init' value.
+    $mail_edited_value = $edited_value;
+  }
+  return $to_store;
+}
+
+/**
+ * Provides the unencrypted dbee email address values.
+ *
+ * Provide the encrypted values for 2 fields of the {users_field_data} table
+ * (the 'mail' and 'init' fields).
+ *
+ * @param array $encrypted
+ *   An array of encrypted email addresses. Keys are 'mail' and 'init'.
+ * @param bool $prev_encrypt
+ *   If TRUE, use a previous dbee encryption profile to decrypt, which is
+ *   used when changing the encryption settings. Defaults to FALSE.
+ *
+ * @return array
+ *   An array of encrypted email addresses. Keys are 'mail' and 'init'.
+ */
+function dbee_unstore(array $encrypted, $prev_encrypt = FALSE) {
+  if (!is_array($encrypted)) {
+    return [];
+  }
+
+  $to_unstore = [];
+  $mail_value = $mail_init_equal = FALSE;
+  foreach (['mail', 'init'] as $dbee_field) {
+    if (empty($encrypted[$dbee_field])) {
+      $to_unstore[$dbee_field] = '';
+    }
+    else {
+      $field_value = $encrypted[$dbee_field];
+      // For performance reasons, do not decrypt the same value twice.
+      $mail_init_equal = ($mail_value !== FALSE && $field_value == $mail_value);
+      // Return the unencrypted values.
+      $to_unstore[$dbee_field] = ($mail_value === FALSE || !$mail_init_equal) ? dbee_decrypt($field_value, $prev_encrypt) : $to_unstore['mail'];
+      // Save the 'mail' value in order to compare it to the 'init' value.
+      $mail_value = $field_value;
+    }
+  }
+  return $to_unstore;
+}
+
+/**
+ * Fixes the encrypted mail and init values for a user object.
+ *
+ * Decrypt 'mail' and 'init' variables from the user object. Note that the user
+ * object is passed by reference.
+ *
+ * @param object $account
+ *   A user object. Only $account->mail and $account->init are used.
+ */
+function dbee_extract(&$account) {
+  if (!empty($account->id())) {
+    $crypted = [];
+    foreach (['mail', 'init'] as $dbee_field) {
+      if (!empty($account->$dbee_field->value)) {
+        $crypted[$dbee_field] = $account->$dbee_field->value;
+      }
+    }
+    if (!empty($crypted)) {
+      $decrypted = dbee_unstore($crypted);
+      foreach (['mail', 'init'] as $dbee_field) {
+        if (!empty($decrypted[$dbee_field])) {
+          // Apply decryption to the user entity.
+          $account->$dbee_field->value = $decrypted[$dbee_field];
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Retrieves the {users_field_data} database encrypted values.
+ *
+ * By using an untagged query, the dbee_query_alter() function is ignored.
+ * So, this function returns unaltered values from the database.
+ *
+ * @param int|null $uid
+ *   The uid to retrieve. Defaults to NULL, which returns all users.
+ * @param int|null $offset
+ *   The result to start from. Defaults to NULL.
+ * @param int|null $limit
+ *   The maximum number of results to return. Defaults to NULL, which returns
+ *   all rows.
+ *
+ * @return array
+ *   Keys are the user ID (uid) values. The values are an object with
+ *   the following properties: 'uid', 'mail', 'init'.
+ */
+function dbee_stored_users($uid = NULL, $offset = NULL, $limit = NULL) {
+  $query = \Drupal::database()->select('users_field_data', 'ufd')
+    ->fields('ufd', ['uid', 'name', 'mail', 'init'])
+    ->condition('ufd.uid', 0, '<>');
+  $or = $query->orConditionGroup()
+    ->isNotNull('mail')
+    ->isNotNull('init');
+  $query->condition($or);
+
+  if (!empty($uid) && is_numeric($uid) && $uid > 0) {
+    $query->condition('ufd.uid', $uid, '=');
+  }
+  if (empty($offset)) {
+    $offset = 0;
+  }
+
+  if ($offset > 0 || (!empty($limit) && is_numeric($limit) && $limit > 0)) {
+    $query->range($offset, $limit);
+  }
+  $query->orderBy('ufd.uid');
+  $users_objects = $query->execute();
+  // Returns a multidimensional array.
+  $users = [];
+  foreach ($users_objects as $record) {
+    foreach (['uid', 'name', 'mail', 'init'] as $field) {
+      $users[$record->uid][$field] = $record->$field;
+    }
+  }
+  return $users;
+}
+
+/**
+ * Implements hook_entity_load().
+ *
+ * Decrypts the mail and init addresses when loading a user object.
+ * hook_entity_load() is called before hook_ENTITY_TYPE_load().
+ */
+function dbee_entity_load(array $entities, $entity_type_id) {
+
+  if ($entity_type_id == 'user') {
+    // Decrypt the email address when a user is loaded.
+    // This makes the email address available to the system.
+    foreach ($entities as $record) {
+      dbee_extract($record);
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ *
+ * Encrypt the email address when saving a user account. hook_entity_presave()
+ * is called after hook_ENTITY_TYPE_presave().
+ */
+function dbee_entity_presave(EntityInterface $entity) {
+
+  $type = $entity->getEntityTypeId();
+  if ($type == 'user') {
+    // Set a variable containing the unencrypted email address values to
+    // encrypt.
+    $uncrypted = [];
+    foreach (['mail', 'init'] as $dbee_field) {
+      if (!empty($entity->$dbee_field->value)) {
+        $uncrypted[$dbee_field] = $entity->$dbee_field->value;
+      }
+      else {
+        $uncrypted[$dbee_field] = NULL;
+      }
+    }
+    // Encrypt the email address values.
+    $to_update = dbee_store($uncrypted);
+    // Replace unencrypted email address values with encrypted email address
+    // values in the User object.
+    foreach ($to_update as $field => $value) {
+      // Mail and init.
+      if ($value) {
+        $entity->$field->value = $value;
+      }
+    }
+  }
+  elseif (!$entity->isNew() && (($type == 'key' && $entity->getOriginalId() == dbee_current_key_id()) || ($type == 'encryption_profile' && $entity->getOriginalId() == DBEE_ENCRYPT_NAME)) && dbee_entity_change($entity)) {
+    // The encryption parameters will change.
+    $set_prev_encrypt = FALSE;
+    $set_prev_key = FALSE;
+    $reencrypt_all = FALSE;
+    if ($type == 'key' && $entity->getOriginalId() == dbee_current_key_id()) {
+      if (!\Drupal::service('key.repository')->getKey(DBEE_PREV_KEY_NAME)) {
+        $copy = $entity->original->createDuplicate();
+        $copy->set('name', DBEE_PREV_KEY_NAME);
+        $copy->set('id', DBEE_PREV_KEY_NAME);
+        $copy->set('label', 'Previous DataBase Email Encryption key');
+        $copy->set('description', 'Previous Dbee key for decrypting users email addresses.');
+        if ($copy->save() && \Drupal::service('key.repository')->getKey(DBEE_PREV_KEY_NAME)) {
+          \Drupal::logger('dbee')->info('Dbee key is going to change, previous key is saved.');
+          $set_prev_encrypt = $set_prev_key = TRUE;
+        }
+        else {
+          \Drupal::logger('dbee')->critical('Dbee key is going to change, and the previous key is not saved !');
+        }
+      }
+      else {
+        $set_prev_encrypt = TRUE;
+      }
+    }
+    elseif ($type == 'encryption_profile' && $entity->getOriginalId() == DBEE_ENCRYPT_NAME) {
+      $set_prev_encrypt = TRUE;
+    }
+
+    if ($set_prev_encrypt) {
+      $dbee_encrypt = ($type != 'encryption_profile') ? EncryptionProfile::load(DBEE_ENCRYPT_NAME) : $entity->original;
+      $prev_encrypt_profile = EncryptionProfile::load(DBEE_PREV_ENCRYPT_NAME);
+      if ($dbee_encrypt && !$prev_encrypt_profile) {
+        $copy = $dbee_encrypt->createDuplicate();
+        $copy->set('name', DBEE_PREV_ENCRYPT_NAME);
+        $copy->set('id', DBEE_PREV_ENCRYPT_NAME);
+        $copy->set('label', "Previous Dbee {$dbee_encrypt->getEncryptionMethodId()}");
+        if ($set_prev_key) {
+          $copy->set('encryption_key', DBEE_PREV_KEY_NAME);
+        }
+        if ($copy->save() && EncryptionProfile::load(DBEE_PREV_ENCRYPT_NAME)) {
+          \Drupal::logger('dbee')->info('Dbee key is going to change, encrypt profile saved with prev key values.');
+          // Save the new settings.
+          // Next, decrypt all user email addresses.
+          // Finally, re-encrypt the email addresses with the new parameters.
+          $reencrypt_all = TRUE;
+        }
+        else {
+          \Drupal::logger('dbee')->critical('Dbee key is going to change, encrypt profile is not saved with prev key values. !');
+        }
+      }
+      elseif ($dbee_encrypt && $prev_encrypt_profile) {
+        $reencrypt_all = TRUE;
+      }
+    }
+
+    if ($reencrypt_all) {
+      // Wait for the save to complete. Flag to re-encrypt.
+      $entity->dbee_change = TRUE;
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function dbee_entity_update(EntityInterface $entity) {
+  if (($entity->getEntityTypeId() == 'key' || ($entity->getEntityTypeId() == 'encryption_profile' && $entity->getOriginalId() == DBEE_ENCRYPT_NAME)) && !empty($entity->dbee_change)) {
+    // Batch for decrypting all user email addresses and then
+    // re-encrypting them with the new parameters.
+    \Drupal::moduleHandler()->loadInclude('dbee', 'inc', 'dbee.users');
+    dbee_update_crypt_all('change', 'change', TRUE);
+    dbee_update_crypt_all('encrypt', 'change', TRUE);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update().
+ *
+ * Decrypt the email addresses after saving.
+ */
+function dbee_user_update(EntityInterface $entity) {
+  // Decrypt the email addresses after saving.
+  // The user object provides unencrypted email address values.
+  dbee_extract($entity);
+  _dbee_all_users_uncrypted(FALSE, $entity);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_insert().
+ *
+ * Decrypt the email addresses after saving.
+ *
+ * @see dbee_user_update()
+ */
+function dbee_user_insert(EntityInterface $entity) {
+  dbee_user_update($entity);
+  _dbee_all_users_uncrypted(FALSE, $entity);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_view().
+ *
+ * This function displays an explicit message on the user profile page
+ * about email address encryption. It is displayed only to users with the
+ * 'administer dbee' permission.
+ */
+function dbee_user_view(array &$build, EntityInterface $entity, EntityViewDisplayInterface $display, $view_mode) {
+  if ($display->getComponent('dbee')) {
+    if (\Drupal::currentUser()->hasPermission('administer dbee')) {
+      // Use a static query to bypass the dbee_query_alter() function.
+      $uid = $entity->id();
+      $stored_account = dbee_stored_users($uid);
+      $stored_mail = $stored_account[$uid]['mail'] ?? NULL;
+
+      $arg = ['%name' => $entity->getAccountName()];
+      // Handle the output message about email address encryption.
+      if (empty($stored_mail)) {
+        $email_status = t('No contact email address registered for %name.', $arg);
+      }
+      elseif (!\Drupal::service('email.validator')->isValid($stored_mail)) {
+        $stored_mail_decrypted = dbee_decrypt($stored_mail);
+        if ($stored_mail_decrypted != $stored_mail) {
+          $email_status = t("The %name's contact email address is encrypted.", $arg);
+        }
+        else {
+          $email_status = t("The %name's contact email address is encrypted but corrupted. Sending email to this user will fail.", $arg);
+        }
+      }
+      else {
+        $email_status = t("The %name's contact email address is not encrypted.", $arg);
+      }
+
+      // Display a new field on the user profile page. Use the same theming as
+      // 'member_for' from user_user_view().
+      $build['dbee'] = [
+        '#type' => 'item',
+        '#markup' => '<h4 class="label">' . t('Security') . '</h4> ' . $email_status,
+      ];
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_extra_field_info().
+ *
+ * View extra field for encryption status.
+ */
+function dbee_entity_extra_field_info() {
+  $fields['user']['user']['display']['dbee'] = [
+    'label' => t('Email encryption'),
+    'description' => t('Display the email encryption status.'),
+    'weight' => 15,
+    // member_for weight is 5. dbee will appear below the member_for markup.
+    'visible' => FALSE,
+  ];
+
+  return $fields;
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ *
+ * Display the dbee extra_field if permitted.
+ */
+function dbee_entity_view_alter(&$build, EntityInterface $entity, EntityViewDisplayInterface $display) {
+  if ($entity->getEntityTypeId() == 'user') {
+    if (isset($build['dbee'])) {
+      $build['dbee']['#access'] = \Drupal::currentUser()->hasPermission('administer dbee');
+    }
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Change the hook order. The purpose is to improve compatibility with
+ * custom modules: call the dbee module at an early stage for decrypting and
+ * at a late stage for encrypting.
+ */
+function dbee_module_implements_alter(&$implementations, $hook) {
+
+  // To improve compatibility with custom modules, decrypt at an early stage.
+  $hook_decrypt = [
+    'entity_load',
+    'user_insert',
+    'user_update',
+  ];
+  if (in_array($hook, $hook_decrypt) && isset($implementations['dbee'])) {
+    $group = $implementations['dbee'];
+    unset($implementations['dbee']);
+    $implementations = array_merge(['dbee' => $group], $implementations);
+  }
+
+  // To improve compatibility with custom modules, encrypt at a late stage.
+  $hook_encrypt = [
+    'entity_presave',
+    'query_alter',
+    'query_user_load_multiple_alter',
+    'query_pager_alter',
+    'entity_query_alter',
+  ];
+  if (in_array($hook, $hook_encrypt) && isset($implementations['dbee'])) {
+    $group = $implementations['dbee'];
+    unset($implementations['dbee']);
+    $implementations['dbee'] = $group;
+  }
+}
+
+/**
+ * Implements hook_query_alter().
+ *
+ * Encrypt the email addresses on queries. This hook is only called on dynamic
+ * tagged queries. The 'dbee' tag is not required. For example, the query from
+ * the user_load_by_mail() function is altered because of the
+ * 'user_load_multiple' tag. On the contrary, the user_account_form_validate()
+ * is not tagged, so the hook_query_alter() function is not called, that why I
+ * replace this function by the custom function
+ * (dbee_user_account_form_validate()). The dbee_query_alter() function
+ * encrypts any dynamic tagged query that contains the mail or init field in
+ * the where clause. Acting on tags:
+ * - If the query contains the tag 'dbee_disabled', no alteration occurs.
+ * - If the query contains the tags 'dbee_mail_disable_insensitive_case' or
+ *   'dbee_init_disable_insensitive_case': the search will be case-sensitive
+ *   (it is not the default behavior on mysql; read the code and issue below).
+ * Tags added by the dbee module:
+ * - 'dbee_mail' if the query contains users.mail field in the where clause.
+ * - 'dbee_init' if the query contains users.init field in the where clause.
+ */
+function dbee_query_alter(AlterableInterface $query) {
+
+  $users_alias = FALSE;
+  $tables = &$query->getTables();
+  foreach ($tables as $table_properties) {
+    if ($table_properties['table'] == 'users_field_data') {
+      // The users table is queried.
+      $users_alias = $table_properties['alias'];
+      break;
+    }
+  }
+
+  if ($users_alias) {
+    // The {users_field_data} table is queried.
+    $dbee_fields = ['mail', 'init'];
+    foreach ($dbee_fields as $dbee_field) {
+      $field_selected[$dbee_field] = FALSE;
+      // Set a default mail alias.
+      $dbee_alias[$dbee_field] = $dbee_field;
+    }
+    // Check if all fields have been loaded.
+    if (is_array($tables[$users_alias]) && array_key_exists('all_fields', $tables[$users_alias]) && $tables[$users_alias]['all_fields']) {
+      foreach ($dbee_fields as $dbee_field) {
+        $field_selected[$dbee_field] = TRUE;
+        // Optional. The mail alias is the same as default but the value has
+        // been confirmed.
+        $dbee_alias[$dbee_field] = $dbee_field;
+      }
+    }
+    else {
+      // Or at least the mail or init fields.
+      $fields = &$query->getFields();
+      foreach ($fields as $field_properties) {
+        if ($field_properties['table'] == $users_alias) {
+          foreach ($dbee_fields as $dbee_field) {
+            if ($field_properties['field'] == $dbee_field) {
+              $field_selected[$dbee_field] = TRUE;
+              $dbee_alias[$dbee_field] = $field_properties['alias'];
+            }
+          }
+        }
+      }
+    }
+
+    foreach ($dbee_fields as $dbee_field) {
+      if ($field_selected[$dbee_field]) {
+        // The 'mail' or the 'init' field from the table 'users_field_data' is
+        // queried. The 'dbee_mail' or 'dbee_init' tags inform that the result
+        // set will probably return encrypted mail values and should go
+        // through the dbee_decrypt() function!
+        $query->addTag('dbee_' . $dbee_field);
+      }
+    }
+
+    // Handle the WHERE clause.
+    // The 'dbee_disabled' tag disables all dbee stuff on queries.
+    if (!$query->hasTag('dbee_disabled')) {
+      _dbee_where_clause($query, $users_alias, $dbee_alias);
+    }
+
+  }
+}
+
+/**
+ * Helper for reformatting encryption-related database queries.
+ *
+ * Regarding the field, operator and value in the where clause, return the
+ * corresponding changed values. For example: replace "WHERE mail LIKE
+ * 'john@example.com'" by  "WHERE uid IN (2, 7)" or "WHERE uid = 3".
+ */
+function _dbee_where_clause(&$query, $users_alias, $dbee_alias) {
+  // Handle the WHERE clause.
+  $dbee_fields = ['mail', 'init'];
+  $where = &$query->conditions();
+
+  foreach ($where as $placeholder => $where_properties) {
+    if (is_array($where_properties) && array_key_exists('field', $where_properties) && array_key_exists('value', $where_properties)) {
+      if (is_object($where_properties['field'])) {
+        // For nested conditions (db_or()). Used by user_search_execute().
+        _dbee_where_clause($where[$placeholder]['field'], $users_alias, $dbee_alias);
+      }
+      elseif (is_string($where_properties['field'])) {
+        // Used by the load_by_mail_user() core function.
+        foreach ($dbee_fields as $dbee_field) {
+          // Alias: 'users_field_data.mail' or 'mail' in most cases.
+          $where_alias = _dbee_build_alias($dbee_field, 'users_field_data', $dbee_alias[$dbee_field], $users_alias);
+          $where_dbee_field = $db_funct = FALSE;
+          if (in_array($where_properties['field'], $where_alias)) {
+            $where_dbee_field = TRUE;
+          }
+          elseif ($db_funct = _dbee_db_functions_clause($where_properties['field'])) {
+            $funct_op = $db_funct['op'];
+            foreach ($db_funct['fields'] as $funct_field) {
+              if (in_array($funct_field, $where_alias)) {
+                $where_dbee_field = TRUE;
+                break;
+              }
+            }
+          }
+          if ($where_dbee_field) {
+            // The where clause does contain the mail or init fields!
+            // First, handle simple or multiple values.
+            $where_strings = [];
+            if (is_string($where_properties['value'])) {
+              // The user_load_by_mail() core function needs the code below.
+              $where_strings[] = $where_properties['value'];
+            }
+            elseif (is_array($where_properties['value'])) {
+              $where_strings = $where_properties['value'];
+            }
+            else {
+              // This case should never occur.
+              continue;
+            }
+
+            if (count($where_strings) == 1 && current($where_strings) === '') {
+              continue;
+            }
+
+            // Initialisation:
+            $need_rewrite = FALSE;
+            $new_values = [];
+            $new_field = FALSE;
+            $operator = isset($where_properties['operator']) ? mb_strtoupper($where_properties['operator']) : '';
+            if (empty($operator) && !empty($funct_op)) {
+              $operator = $funct_op;
+            }
+            $where_match = in_array($operator, ['LIKE', '=', 'IN']);
+
+            $insensitive_search = (in_array($operator, ['LIKE', 'NOT LIKE']));
+            // Special behavior regarding issues #2324701 and #2616264
+            // (https://www.drupal.org/node/2616264#comment-10576582)
+            // Due to MySQL collation, queries are executed as case-insensitive.
+            // Current issue for D8: #2490294
+            // Provide a tag to disable this behavior, which is needed for
+            // testing and custom modules: dbee_mail_disable_insensitive_case
+            // and dbee_init_disable_insensitive_case.
+            $connection = \Drupal::service('database');
+            if (empty($query->alterTags["dbee_{$dbee_field}_disable_insensitive_case"]) && !($connection->databaseType() == 'pgsql' && $dbee_field == 'init')) {
+              $insensitive_search = 'TRUE';
+            }
+
+            // The WHERE clause must decrypt all users in complex searches
+            // with wildcards ('_' and '%').
+            // Look for unescaped wildcards.
+            // Find active '%' and '_'mysql wildcards.
+            $pattern_wildcards = '[^\\\\]%|^%|[^\\\\]_|^_';
+            // The custom method is not the default one. It is faster but less
+            // powerful because it will return the user only if the complete
+            // mail string is provided.
+            $wildcard_search = FALSE;
+            if (in_array($operator, ['LIKE', 'NOT LIKE'])) {
+              foreach ($where_strings as $string) {
+                if (preg_match("!$pattern_wildcards!", $string) === 1) {
+                  $wildcard_search = TRUE;
+                  break;
+                }
+              }
+            }
+            $no_encrypt_value = [];
+            if (!$wildcard_search) {
+              // Check if the value needs to be encrypted.
+              foreach ($where_strings as $string) {
+                $no_encrypt_value[] = (!dbee_email_to_alter($string));
+              }
+              $no_encrypt_value[] = array_values(array_unique($no_encrypt_value));
+              if (count($no_encrypt_value) == 1 && $no_encrypt_value[0]) {
+                $need_rewrite = FALSE;
+              }
+            }
+
+            if ($wildcard_search || TRUE) {
+              $need_rewrite = TRUE;
+              $target_field = (!$db_funct) ? $dbee_field : $where_properties['field'];
+              $result_uids = _dbee_where_mailfields2uid($where_strings, $target_field, $operator, $insensitive_search);
+              $n_matching_user = count($result_uids);
+              if ($n_matching_user == 0) {
+                // No users match. Returns "WHERE 0 = '1'".
+                $new_field = 1;
+                $new_values[0] = 0;
+              }
+              else {
+                $new_field = $users_alias . '.uid';
+                $new_values = $result_uids;
+              }
+            }
+
+            if ($need_rewrite) {
+              if (!$where_match) {
+                // Add to ignore empty values.
+                // Retrieve empty values.
+                $connection = \Drupal::database();
+                $empty_users = $connection->select('users_field_data', 'ufd')
+                  ->fields('ufd', ['uid'])
+                  ->condition(($connection->condition('OR'))->condition("ufd.{$dbee_field}", '', '=')->isNull("ufd.{$dbee_field}"))
+                  ->execute();
+                $added_empty = FALSE;
+                foreach ($empty_users as $account) {
+                  if (array_search($account->uid, $new_values) === FALSE) {
+                    if ($new_field == $users_alias . '.uid') {
+                      $new_values[] = $account->uid;
+                      $added_empty = TRUE;
+                    }
+                    else {
+                      // Case 1 = 0 but need to eliminate some results.
+                      $new_field = $users_alias . '.uid';
+                      $new_values[] = $account->uid;
+                    }
+                  }
+                }
+                if ($added_empty) {
+                  sort($new_values);
+                }
+              }
+
+              // Finally, edit the WHERE condition.
+              if (count($new_values) == 1) {
+                $where[$placeholder]['operator'] = ($where_match) ? '=' : '<>';
+                $where[$placeholder]['value'] = $new_values[0];
+              }
+              else {
+                $where[$placeholder]['operator'] = ($where_match) ? 'IN' : 'NOT IN';
+                $where[$placeholder]['value'] = $new_values;
+              }
+              if (!empty($new_field)) {
+                if ($new_field !== 1) {
+                  $where[$placeholder]['field'] = $new_field;
+                }
+                else {
+                  // The condition always fails.
+                  // Use "Where uid < 0" instead of "Where 1 = 0".
+                  $where[$placeholder]['field'] = $users_alias . '.uid';
+                  $where[$placeholder]['operator'] = '<';
+                  $where[$placeholder]['value'] = 0;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Provides the corresponding UID to a db WHERE clause, decrypting all users.
+ *
+ * Convert database wildcards to php regex patterns. Use the cache if called
+ * several times during a script.
+ *
+ * @param array $keys
+ *   An array of research strings using database wildcards ('%' and '_').
+ * @param string $field
+ *   The field in the {users_field_data} table: Can be 'mail' (default)
+ *   or 'init'.
+ * @param string $operator
+ *   The operator on the WHERE clause. Defaults to 'LIKE'.
+ * @param bool $insensitive_search
+ *   Determines whether the search should be case-insensitive.
+ *   Defaults to FALSE.
+ *
+ * @return array
+ *   The uids that match the keys (no index).
+ */
+function _dbee_where_mailfields2uid(array $keys, $field = 'mail', $operator = 'LIKE', $insensitive_search = FALSE) {
+
+  $db_funct = FALSE;
+  if (empty($keys) || (!is_array($keys)) || (!in_array($field, ['mail', 'init']) && (!$db_funct = _dbee_db_functions_clause($field)))) {
+    return [];
+  }
+
+  // Prepare the regex patterns corresponding to the key(s).
+  $patterns = [];
+  // Look for unescaped wildcards.
+  // Find active '%' mysql wildcard, replaced by php regex '.*'.
+  $pattern_percent = '[^\\\\]%|^%';
+  // Find active '_' mysql wildcard, replaced by php regex '.'.
+  $pattern_underscore = '[^\\\\]_|^_';
+  $pattern_wildcards = "$pattern_percent|$pattern_underscore";
+  $like = in_array($operator, ['LIKE', 'NOT LIKE']);
+  foreach ($keys as $key) {
+    // Prepare the key.
+    $php_value = ($like && preg_match("!^%!", $key) === 1) ? '#' : '#^';
+    if ($like) {
+
+      $split_value = preg_split("!($pattern_wildcards)!", $key, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY);
+      $index_max = count($split_value) - 1;
+      foreach ($split_value as $index => $string) {
+        if (mb_strlen($string) <= 2) {
+          $substring = $string;
+          $replace_by = '';
+          if (preg_match("!([^\\\\])%|()^%!", $string, $previous_char) === 1) {
+            $replace_by = ($index > 0 && $index < $index_max) ? '.*' : '';
+            $substring = $previous_char[1];
+          }
+          elseif (preg_match("!([^\\\\])_|()^_!", $string, $previous_char) === 1) {
+            $replace_by = '.';
+            $substring = $previous_char[1];
+          }
+          // db_like() add addcslashes() function.
+          $php_value .= quotemeta(stripcslashes($substring)) . $replace_by;
+        }
+        else {
+          $php_value .= quotemeta(stripcslashes($string));
+        }
+      }
+    }
+    else {
+      $php_value .= quotemeta($key);
+    }
+    if ($insensitive_search) {
+      $php_value = mb_strtolower($php_value);
+    }
+
+    $php_value .= ($like && preg_match("!%$!", $key) === 1) ? '#' : '$#';
+    $patterns[] = $php_value;
+  }
+
+  // Decrypt all users.
+  $users = _dbee_all_users_uncrypted();
+
+  $result = [];
+  foreach ($users as $uid => $datas) {
+    if (!$db_funct) {
+      $uncrypted_field = $datas[$field];
+    }
+    else {
+      $uncrypted_field = _dbee_db_functions_value($db_funct, $datas);
+    }
+
+    if ($insensitive_search) {
+      $uncrypted_field = mb_strtolower($uncrypted_field);
+    }
+    // Search the key(s).
+    foreach ($patterns as $pattern) {
+      // Like or Not like never returns for null values.
+      if (!empty($uncrypted_field) && preg_match($pattern, $uncrypted_field)) {
+        // Avoid doublon thanks to the index.
+        $result[$uid] = $uid;
+      }
+    }
+  }
+  return array_values($result);
+}
+
+/**
+ * Returns the list of all user email addresses.
+ *
+ * Decrypt all user email addresses, especially for database queries that
+ * target the mail or init field. Use the static cache because this function
+ * is cpu-intensive.
+ *
+ * @param bool $reset
+ *   TRUE when resetting the cache. Defaults to FALSE.
+ * @param \Drupal\user\UserInterface|null $account
+ *   The user entity.
+ *
+ * @return array
+ *   All users. The first key is the user id, and then keys are "mail", "init",
+ *   and "name". Or an empty array if the $account parameter is provided.
+ */
+function _dbee_all_users_uncrypted($reset = FALSE, User $account = NULL) {
+  $users = &drupal_static(__FUNCTION__);
+
+  // Only one user has changed: update the cache.
+  if ($account && is_object($account)) {
+    // Only one user has changed: update the cache only if it already exists
+    // for performance reasons.
+    if (!empty($users) && !empty($account->id())) {
+      foreach (['mail', 'init', 'name'] as $dbee_field) {
+        if (!empty($account->$dbee_field->value)) {
+          $users[$account->id()][$dbee_field] = $account->$dbee_field->value;
+        }
+      }
+    }
+    return [];
+  }
+  if (empty($users) || $reset) {
+    $users = [];
+    $all_mails = dbee_stored_users();
+    foreach ($all_mails as $uid => $crypted) {
+      $decrypted_fields = dbee_unstore($crypted);
+      $users[$uid] = $decrypted_fields;
+      $users[$uid]['name'] = $crypted['name'];
+    }
+  }
+  return $users;
+}
+
+/**
+ * Provides a list of possible mysql aliases for a field in a table.
+ *
+ * Consider alias values for field and table, handling if the field alias
+ * includes the table name (case: $field_alias = "users.mail").
+ *
+ * @param string $field
+ *   The exact field name in the database (example: "mail").
+ * @param string $table
+ *   The table name in the database (example: "drupal_user").
+ *   Optional. Defaults to empty.
+ * @param string $field_alias
+ *   The alias field name in the query (example: "user_mail" or
+ *   "user.mail"). Optional. Defaults to empty.
+ * @param string $table_alias
+ *   The alias table name in the query (example: "user_table").
+ *   Optional. Defaults to empty.
+ *
+ * @return array
+ *   All possible values that match the field according to the query
+ *   (example: "mail", "user_mail", "user.mail", "user_table.mail",
+ *   "user.user_mail", "user_table.user_mail").
+ */
+function _dbee_build_alias($field, $table = '', $field_alias = '', $table_alias = '') {
+  // If there is no field, there is no alias.
+  if (empty($field)) {
+    return [];
+  }
+  // Handle the field.
+  $alias = [$field];
+
+  // Handle the field alias.
+  if (empty($field_alias)) {
+    $field_alias = $field;
+  }
+  $alias[] = $field_alias;
+
+  // If a table has been provided.
+  if (!empty($table)) {
+    $alias[] = "{$table}.{$field}";
+
+    // Handle the table alias.
+    if (empty($table_alias)) {
+      $table_alias = $table;
+    }
+    $alias[] = "{$table_alias}.{$field}";
+
+    // Handle the field alias with the table.
+    if (strpos($field_alias, '.') === FALSE) {
+      // $field_alias does not contain the table.
+      $alias[] = "{$table}.{$field_alias}";
+      $alias[] = "{$table_alias}.{$field_alias}";
+    }
+  }
+
+  // Format the result.
+  $alias = array_unique($alias);
+  $alias = array_values($alias);
+  return $alias;
+}
+
+/**
+ * Manages database functions in a conditional clause query.
+ *
+ * Special clauses can involve mysql or other database functions, especially
+ * those from the admin/people page.
+ *
+ * @param string $clause
+ *   A clause that may contain a database function, such as: "CONCAT_WS(' ',
+ *   users_field_data.name, ' ', users_field_data.mail) LIKE :views_combine".
+ *
+ * @return array|bool
+ *   Keys are: 'db_funct' (the database function name, example:
+ *   'CONCACT_WS'), 'fields' (an array of field names) and 'op' (a string
+ *   corresponding to the operator). Or FALSE if the clause does not contain a
+ *   database function.
+ */
+function _dbee_db_functions_clause($clause) {
+  if (is_string($clause)) {
+    // More DB function than CONCAT_WS can be managed. Their code will be here.
+    // CONCAT_WS exists for both mysql and postgres.
+    $db_functions = ['CONCAT_WS'];
+    foreach ($db_functions as $db_funct) {
+      $fields = $field_names = [];
+      $op = FALSE;
+      if (substr($clause, 0, strlen($db_funct)) == $db_funct) {
+        // Search "CONCAT_WS(' ', ufd.name, ' ', ufd.mail) LIKE :views_combine".
+        $pos1 = strpos($clause, '(');
+        $pos2 = strrpos($clause, ')');
+        $in_brackets = substr($clause, ($pos1 + 1), ($pos2 - $pos1 - 1));
+        $after_brackets = substr($clause, ($pos2 + 1));
+        if (!empty($after_brackets)) {
+          $op = trim($after_brackets);
+          $op = trim(mb_strtoupper(substr($op, 0, strpos($op, ' '))));
+        }
+        if (!empty($in_brackets)) {
+          $in_brackets_array = explode(',', $in_brackets);
+          foreach ($in_brackets_array as $field) {
+            // Do not delete space char.
+            $field = trim($field);
+            $field = (!in_array($field, [' ', "' '", '" "'])) ? $field : " ";
+            $fields[] = $field;
+            $dot_pos = strrpos($field, '.');
+            $field_names[] = ($dot_pos === FALSE) ? $field : substr($field, ($dot_pos + 1));
+          }
+        }
+      }
+      if (!empty($fields) && !empty($op)) {
+        return [
+          'db_funct' => $db_funct,
+          'fields' => $fields,
+          'field_names' => $field_names,
+          'op' => $op,
+        ];
+      }
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Converts database functions into values for php.
+ *
+ * @param array $db_funct
+ *   The array returned by the _dbee_db_functions_clause() function.
+ * @param array $user
+ *   An array of user information. Keys are mail, init, and name.
+ *
+ * @return string
+ *   The value corresponding to the one that should be returned by the database
+ *   query.
+ *
+ * @see _dbee_db_functions_clause()
+ */
+function _dbee_db_functions_value(array $db_funct, array $user) {
+  $funct = $db_funct['db_funct'];
+  $return = '';
+  if ($funct == 'CONCAT_WS') {
+    $separator = array_shift($db_funct['field_names']);
+    $values = [];
+    foreach ($db_funct['field_names'] as $field) {
+      $value = (in_array($field, ['mail', 'init', 'name'])) ? $user[$field] : $field;
+      if ($value === NULL) {
+        continue;
+      }
+      $values[] = $value;
+    }
+    $return = implode($separator, $values);
+  }
+  return $return;
+}
+
+/**
+ * Implements hook_entity_access().
+ *
+ * Prevent deleting dbee encrypt and key entities.
+ * Use the dbee module permission for updating.
+ */
+function dbee_entity_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  if (in_array($entity->getEntityTypeId(), ['encryption_profile', 'key'])) {
+    $id = $entity->getOriginalId();
+    $protected_encrypt_ids = [DBEE_ENCRYPT_NAME, DBEE_PREV_ENCRYPT_NAME];
+    $protected_key_ids = [DBEE_DEFAULT_KEY_NAME, DBEE_PREV_KEY_NAME];
+    $dbee_current_key_id = dbee_current_key_id();
+    if (!in_array($dbee_current_key_id, $protected_key_ids)) {
+      $protected_key_ids[] = $dbee_current_key_id;
+    }
+    if (($entity->getEntityTypeId() == 'encryption_profile' && in_array($id, $protected_encrypt_ids)) || ($entity->getEntityTypeId() == 'key' && in_array($id, $protected_key_ids))) {
+      switch ($operation) {
+        case 'delete':
+          return AccessResult::forbidden();
+
+        case 'view':
+          return AccessResult::allowedIfHasPermission($account, 'administer dbee');
+
+        case 'update':
+          return in_array($id, [DBEE_PREV_KEY_NAME, DBEE_PREV_KEY_NAME]) ? AccessResult::forbidden() : AccessResult::allowedIfHasPermission($account, 'administer dbee');
+      }
+    }
+  }
+}
+
+/**
+ * Provides the key name used by the dbee encryption profile.
+ *
+ * Upon install, it is the dbee key, but it can be changed manually by a user
+ * wth the 'administer dbee' permission.
+ */
+function dbee_current_key_id() {
+  $dbee_current_key_id = FALSE;
+  if ($dbee_encrypt = EncryptionProfile::load(DBEE_ENCRYPT_NAME)) {
+    if (!empty($dbee_encrypt->getEncryptionKeyId()) && \Drupal::service('key.repository')->getKey($dbee_encrypt->getEncryptionKeyId())) {
+      $dbee_current_key_id = $dbee_encrypt->getEncryptionKeyId();
+    }
+  }
+  return $dbee_current_key_id;
+}
+
+/**
+ * Returns TRUE if the entity has changed during presave.
+ */
+function dbee_entity_change($entity) {
+  if (empty($entity->original)) {
+    return TRUE;
+  }
+  $original = $entity->original;
+  // Compare.
+  $equal = TRUE;
+  $ignore = ['original', 'submit', 'form_build_id', 'form_token', 'form_id'];
+  $private_methods = [];
+  if ($entity->getEntityTypeId() == 'encryption_profile') {
+    $private_methods = [
+      'getPluginCollections',
+      'getEncryptionMethod',
+      'getEncryptionMethodId',
+      'getEncryptionKey',
+      'getEncryptionKeyId',
+    ];
+  }
+  elseif ($entity->getEntityTypeId() == 'key') {
+    // @todo Unfortunately, each method return the private property
+    // 'stringTranslation' to the $entity that is not present in $original.
+    // As a consequence, comparison of identical keys will fail because they
+    // return as different. The data is unaffected, but re-rencryption
+    // will occur upon updating a key with no changes, which consumes
+    // resources.
+    $private_methods = [
+      'getKeyType',
+      'getKeyProvider',
+      'getKeyInput',
+      'getKeyValue',
+      'getKeyValues',
+    ];
+  }
+  $diff = [];
+  foreach ($entity as $key => $value) {
+    if (!in_array($key, $ignore) && $entity->$key != $original->$key) {
+      $equal = FALSE;
+      $diff[$key]['old'] = $original->$key;
+      $diff[$key]['new'] = $entity->$key;
+    }
+  }
+  foreach ($private_methods as $method) {
+    if ($entity->$method() != $original->$method()) {
+      $equal = FALSE;
+      $diff[$method]['old'] = $original->$method();
+      $diff[$method]['new'] = $entity->$method();
+    }
+  }
+  return (!$equal);
+}
+
+/**
+ * Implements hook_entity_type_alter().
+ */
+function dbee_entity_type_alter(array &$entity_types) {
+  if (isset($entity_types['user'])) {
+    $entity_types['user']->setClass('Drupal\dbee\Entity\DbeeUser');
+  }
+}
+
+/**
+ * Implements hook_tokens().
+ *
+ * Fix compatibility with the webform module.
+ */
+function dbee_tokens($type, $tokens, array $data, array $options, BubbleableMetadata $bubbleable_metadata) {
+  if (!\Drupal::service('module_handler')->moduleExists('webform') || !\Drupal::service('module_handler')->moduleExists('token')) {
+    return [];
+  }
+
+  $replacements = [];
+  if ($type == 'webform_role' && !empty($data['webform_role'])) {
+    $replacements_crypted = webform_tokens($type, $tokens, $data, $options, $bubbleable_metadata);
+    foreach ($replacements_crypted as $original => $crypted_str) {
+      $crypted_arr = explode(',', $crypted_str);
+      $decrypted = [];
+      foreach ($crypted_arr as $crypted) {
+        $decrypted[] = dbee_decrypt($crypted);
+      }
+      $replacements[$original] = implode(',', $decrypted);
+    }
+  }
+  return $replacements;
+}
+
+/**
+ * Implements hook_help().
+ */
+function dbee_help($route_name, RouteMatchInterface $route_match) {
+  if ($route_name === 'help.page.dbee') {
+    $readme_file = file_exists(__DIR__ . '/README.md') ? __DIR__ . '/README.md' : __DIR__ . '/README.txt';
+    if (!file_exists($readme_file)) {
+      return NULL;
+    }
+    $text = file_get_contents($readme_file);
+    if ($text && !\Drupal::moduleHandler()->moduleExists('markdown')) {
+      return '<pre>' . $text . '</pre>';
+    }
+    else {
+      // Use the Markdown filter to render the README.
+      $filter_manager = \Drupal::service('plugin.manager.filter');
+      $settings = \Drupal::configFactory()->get('markdown.settings')->getRawData();
+      $config = ['settings' => $settings];
+      $filter = $filter_manager->createInstance('markdown', $config);
+      return $filter->process($text, 'en');
+    }
+  }
+  return NULL;
+}
